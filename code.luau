@@ -1,6 +1,6 @@
-print("--- SCRIPT PARSING STARTED ---")
+print("--- SCRIPT [4.0.5-MegaBot] PARSING STARTED ---")
 
-local SCRIPT_VERSION = "4.0.4-Automation system"
+local SCRIPT_VERSION = "4.0.5-MegaBot"
 
 -- --- Services ---
 local Players = game:GetService("Players")
@@ -11,6 +11,7 @@ local Lighting = game:GetService("Lighting")
 local UserGameSettings = UserSettings():GetService("UserGameSettings")
 local TextChatService = game:GetService("TextChatService")
 local StarterGui = game:GetService("StarterGui")
+local HttpService = game:GetService("HttpService")
 
 -- --- Local Player / Character Cache ---
 local LocalPlayer = Players.LocalPlayer
@@ -28,7 +29,24 @@ local BotSettings = {
 	LoopGoToPlayerName = "",
 }
 
--- --- Gift Queue System ---
+-- --- Assignment/Whitelist FSM State (for secure trading) ---
+local AllowedUserName = ""           -- The only user allowed to trade during an assignment
+local Active = false                 -- Whether whitelist enforcement is active
+local SessionEndsAt: number? = nil   -- Epoch ms when assignment should expire locally (advisory)
+local CurrentOrderId = ""            -- Current assigned order id (string)
+local AssignmentSecret = ""          -- Secret to report item receipts
+
+-- ExpectedItems maps lowercase item name -> remaining quantity expected
+local ExpectedItems: { [string]: number } = {}
+-- ExpectedNameToPetId maps lowercase item name -> petId returned by assignment/poll
+local ExpectedNameToPetId: { [string]: string } = {}
+
+-- --- Bot & API Credentials (filled via chat command !token or by editing below) ---
+local API_BASE = ""  -- e.g. "https://your-domain.com"
+local BOT_ID = ""    -- external bot id (matches convex bot.id)
+local BOT_KEY = ""   -- bot secret
+
+-- --- Gift Queue System (legacy/stash/manual) ---
 local giftQueue = {} -- Holds tables like {itemName = "...", senderName = "...", type = "..."}
 
 -- --- Utility Functions ---
@@ -69,6 +87,197 @@ local function findRemoteEventOrFunction(remoteName, expectedParentName)
 		end
 	end
 	return nil
+end
+
+-- --- HTTP Queue (best-effort; may fail if HttpService not allowed client-side) ---
+
+type QueueItem = {
+	method: string,
+	path: string,
+	body: any?,
+	nextAttemptAt: number?,
+	backoffMs: number?,
+}
+
+local requestQueue: { QueueItem } = {}
+local queueBusy = false
+
+local function httpRequest(method: string, path: string, bodyTable: any?, headersExtra: any?)
+	-- Guard: only proceed if API_BASE and credentials are set
+	if API_BASE == "" or BOT_ID == "" or BOT_KEY == "" then
+		return false, { error = "API credentials not configured" }
+	end
+
+	local url = API_BASE .. path
+	local headers = {
+		["Content-Type"] = "application/json",
+		["X-Bot-Id"] = BOT_ID,
+		["X-Bot-Key"] = BOT_KEY,
+	}
+	if headersExtra then
+		for k, v in pairs(headersExtra) do
+			headers[k] = v
+		end
+	end
+
+	local payload = {
+		Url = url,
+		Method = method,
+		Headers = headers,
+	}
+
+	if bodyTable ~= nil then
+		local okEnc, bodyOrErr = pcall(function()
+			return HttpService:JSONEncode(bodyTable)
+		end)
+		if okEnc then
+			payload.Body = bodyOrErr
+		else
+			return false, { error = "JSON encode failed" }
+		end
+	end
+
+	local ok, res = pcall(function()
+		return HttpService:RequestAsync(payload)
+	end)
+
+	if not ok then
+		return false, { error = "RequestAsync failed" }
+	end
+
+	local parsed = res.Body
+	if typeof(res.Body) == "string" and #res.Body > 0 then
+		local okDec, j = pcall(function()
+			return HttpService:JSONDecode(res.Body)
+		end)
+		if okDec then
+			parsed = j
+		end
+	end
+
+	local success = (res.StatusCode >= 200 and res.StatusCode < 300)
+	return success, { status = res.StatusCode, body = parsed }
+end
+
+local function enqueueRequest(method: string, path: string, bodyTable: any?)
+	table.insert(requestQueue, {
+		method = method,
+		path = path,
+		body = bodyTable,
+		nextAttemptAt = 0,
+		backoffMs = 1000,
+	})
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.25)
+		if queueBusy then
+			continue
+		end
+		if #requestQueue == 0 then
+			continue
+		end
+		local now = os.clock() * 1000
+		local item = requestQueue[1]
+		if item.nextAttemptAt and now < item.nextAttemptAt then
+			continue
+		end
+
+		queueBusy = true
+		local ok, res = httpRequest(item.method, item.path, item.body, nil)
+		queueBusy = false
+
+		if ok then
+			table.remove(requestQueue, 1)
+		else
+			-- Simple backoff and retry (cap at ~30s)
+			local backoff = math.min((item.backoffMs or 1000) * 2, 30000)
+			item.backoffMs = backoff
+			item.nextAttemptAt = now + backoff
+		end
+	end
+end)
+
+-- --- Heartbeat and Assignment Poll Loops (best-effort) ---
+
+local CurrentStatus = "online" -- "online" | "offline" | "maintenance" | "in-trade"
+
+local function computeCapacityPct(): number
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if not backpack then return 0 end
+	local count = 0
+	for _, item in ipairs(backpack:GetChildren()) do
+		if item:IsA("Tool") and item:GetAttribute("ItemType") == "Pet" then
+			count += 1
+		end
+	end
+	-- clamp to 100
+	if count > 100 then count = 100 end
+	return count
+end
+
+local function heartbeatLoop()
+	task.spawn(function()
+		while true do
+			task.wait(20)
+			if API_BASE == "" or BOT_ID == "" or BOT_KEY == "" then
+				continue
+			end
+			local hb = {
+				status = CurrentStatus,
+				capacityPct = computeCapacityPct(),
+				version = SCRIPT_VERSION,
+			}
+			enqueueRequest("POST", "/api/bot/heartbeat", hb)
+		end
+	end)
+end
+
+local function assignmentPollLoop()
+	task.spawn(function()
+		while true do
+			task.wait(5)
+			if API_BASE == "" or BOT_ID == "" or BOT_KEY == "" then
+				continue
+			end
+			local ok, res = httpRequest("POST", "/api/bot/assignment/poll", {})
+			if not ok then
+				continue
+			end
+			local body = res.body
+			if typeof(body) ~= "table" then
+				continue
+			end
+			if body.assigned == true then
+				-- expectedItems: array of { petId, name, qty }
+				ExpectedItems = {}
+				ExpectedNameToPetId = {}
+				for _, it in ipairs(body.expectedItems or {}) do
+					if typeof(it) == "table" and typeof(it.name) == "string" and typeof(it.qty) == "number" then
+						local key = string.lower(it.name)
+						ExpectedItems[key] = (ExpectedItems[key] or 0) + it.qty
+						if typeof(it.petId) == "string" then
+							ExpectedNameToPetId[key] = it.petId
+						end
+					end
+				end
+				CurrentOrderId = (typeof(body.orderId) == "string") and body.orderId or ""
+				AssignmentSecret = (typeof(body.assignmentSecret) == "string") and body.assignmentSecret or ""
+				SessionEndsAt = (typeof(body.assignedUntil) == "number") and body.assignedUntil or nil
+				Active = true
+				-- Note: AllowedUserName must be set by operator or external agent via !assign
+				print(string.format("[ASSIGNMENT] Active=true, items=%d, order=%s", (function()
+					local n = 0
+					for _ in pairs(ExpectedItems) do n += 1 end
+					return n
+				end)(), CurrentOrderId))
+			else
+				-- Not assigned
+				-- Keep Active as-is; operators can stop via !stop
+			end
+		end
+	end)
 end
 
 -- --- Command Definitions ---
@@ -165,10 +374,16 @@ function Commands.help(player, args)
 	print("!queuepurge (stash|transactions|all) - Clears pending gift requests.")
 	print("!debloat - Apply performance optimizations.")
 	print("!undebloat - Remove performance optimizations.")
+	print("!assign (username) - Set the only username allowed to trade while Active.")
+	print("!expect (item name) (qty) - Expect item x qty for whitelist acceptance.")
+	print("!expectclear - Clear expected items and stop whitelist.")
+	print("!status - Print current assignment/whitelist status.")
+	print("!stop - Disable whitelist and clear session.")
+	print("!token (botId) (botKey) (apiBase) - Configure API credentials.")
 	print("!help - Show this help.")
 end
 
--- --- New Integrated Commands ---
+-- --- New Integrated Commands (inventory gifting etc.) ---
 
 function Commands.give(player, args)
 	local itemName = table.concat(args, " "):lower()
@@ -210,7 +425,6 @@ function Commands.give(player, args)
 		local itemToGive = nil
 		-- 1. Check equipped item first
 		local equippedTool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
-		-- *** FIX: Use string.find for partial name matching ***
 		if
 			equippedTool
 			and equippedTool.Name:lower():find(itemName, 1, true)
@@ -221,7 +435,6 @@ function Commands.give(player, args)
 		-- 2. If not equipped, check backpack
 		if not itemToGive then
 			for _, item in ipairs(backpack:GetChildren()) do
-				-- *** FIX: Use string.find for partial name matching ***
 				if
 					item:IsA("Tool")
 					and item.Name:lower():find(itemName, 1, true)
@@ -261,15 +474,21 @@ function Commands.give(player, args)
 
 		task.wait(3.0)
 		if LocalPlayer.Character:FindFirstChild(itemToGive.Name) then
-			petGiftingService:FireServer("GivePet", player)
-			print(
-				string.format(
-					"DEBUG [%s]: Fired GivePet for '%s' to %s.",
-					SCRIPT_VERSION,
-					itemToGive.Name,
-					player.Name
+			local ok, err = pcall(function()
+				petGiftingService:FireServer("GivePet", player)
+			end)
+			if ok then
+				print(
+					string.format(
+						"DEBUG [%s]: Fired GivePet for '%s' to %s.",
+						SCRIPT_VERSION,
+						itemToGive.Name,
+						player.Name
+					)
 				)
-			)
+			else
+				warn(string.format("WARN [%s]: GivePet failed: %s", SCRIPT_VERSION, tostring(err)))
+			end
 		else
 			warn(
 				string.format(
@@ -310,8 +529,12 @@ function Commands.givestash(player, args)
 				task.wait(4.0)
 
 				if LocalPlayer.Character:FindFirstChild(item.Name) then
-					petGiftingService:FireServer("GivePet", player)
-					task.wait(5.0)
+					local ok, _ = pcall(function()
+						petGiftingService:FireServer("GivePet", player)
+					end)
+					if ok then
+						task.wait(5.0)
+					end
 				end
 			end
 		end
@@ -351,6 +574,79 @@ function Commands.queuepurge(player, args)
 		end
 		giftQueue = newQueue
 	end
+end
+
+-- --- Whitelist & Assignment Commands ---
+
+function Commands.assign(player, args)
+	if not args[1] or #args[1] == 0 then
+		print("Usage: !assign <username>")
+		return
+	end
+	AllowedUserName = args[1]
+	Active = true
+	print(string.format("Whitelist enabled for user: %s", AllowedUserName))
+end
+
+function Commands.expect(player, args)
+	if not args[1] or not args[2] then
+		print("Usage: !expect <item name> <qty>")
+		return
+	end
+	local qty = tonumber(args[2])
+	if not qty or qty <= 0 then
+		print("Quantity must be > 0")
+		return
+	end
+	local itemName = string.lower(args[1])
+	ExpectedItems[itemName] = (ExpectedItems[itemName] or 0) + qty
+	print(string.format("Expecting %s x%d (total now %d)", itemName, qty, ExpectedItems[itemName]))
+end
+
+function Commands.expectclear(player, args)
+	ExpectedItems = {}
+	ExpectedNameToPetId = {}
+	Active = false
+	AllowedUserName = ""
+	CurrentOrderId = ""
+	AssignmentSecret = ""
+	SessionEndsAt = nil
+	print("Whitelist expectations cleared and disabled.")
+end
+
+function Commands.status(player, args)
+	print("--- Status ---")
+	print("Active:", Active)
+	print("AllowedUserName:", AllowedUserName ~= "" and AllowedUserName or "(none)")
+	print("CurrentOrderId:", CurrentOrderId ~= "" and CurrentOrderId or "(none)")
+	print("SessionEndsAt:", SessionEndsAt or "(none)")
+	local count = 0
+	for k, v in pairs(ExpectedItems) do
+		print(string.format("  %s -> %d", k, v))
+		count += 1
+	end
+	if count == 0 then
+		print("  (no expected items)")
+	end
+end
+
+function Commands.stop(player, args)
+	Active = false
+	print("Whitelist disabled (Active=false).")
+end
+
+function Commands.token(player, args)
+	-- Usage: !token <botId> <botKey> [apiBase]
+	if not args[1] or not args[2] then
+		print("Usage: !token <botId> <botKey> [apiBase]")
+		return
+	end
+	BOT_ID = args[1]
+	BOT_KEY = args[2]
+	if args[3] then
+		API_BASE = args[3]
+	end
+	print("API credentials set.")
 end
 
 -- --- Performance Optimization / Debloater ---
@@ -427,7 +723,9 @@ local function processCommandMessage(message, speaker)
 	for arg in string.gmatch(commandString, "[^%s]+") do
 		table.insert(args, arg)
 	end
-	local commandName = table.remove(args, 1):lower()
+	local commandName = table.remove(args, 1)
+	if not commandName then return end
+	commandName = commandName:lower()
 	local commandFunc = Commands[commandName]
 	if commandFunc then
 		if BotSettings.Owners[speaker.Name] or BotSettings.Unlocked then
@@ -452,27 +750,87 @@ local function setupGiftListener()
 	if not giftEvent or not acceptEvent then return end
 
 	giftEvent.OnClientEvent:Connect(function(transactionId, itemDescription, senderUsername)
+		local descLower = tostring(itemDescription):lower()
 		local shouldAccept = false
-		local foundIndex = nil
+		local matchedQueueIndex = nil
+		local whitelistMatchedNameLower = nil
 
-		for i, request in ipairs(giftQueue) do
-			local senderIsStaff = BotSettings.Owners[senderUsername] == true
-			local senderMatch = (request.senderName == "staff" and senderIsStaff)
-				or (request.senderName == senderUsername)
-			local itemMatch = itemDescription:lower():find(request.itemName, 1, true)
+		-- Whitelist enforcement (preferred)
+		if Active and AllowedUserName ~= "" and senderUsername == AllowedUserName then
+			for nameLower, remaining in pairs(ExpectedItems) do
+				if remaining > 0 and descLower:find(nameLower, 1, true) then
+					shouldAccept = true
+					whitelistMatchedNameLower = nameLower
+					break
+				end
+			end
+		end
 
-			if senderMatch and itemMatch then
-				shouldAccept = true
-				foundIndex = i
-				break
+		-- Legacy queue fallback (stash/transactions)
+		if not shouldAccept then
+			for i, request in ipairs(giftQueue) do
+				local senderIsStaff = BotSettings.Owners[senderUsername] == true
+				local senderMatch = (request.senderName == "staff" and senderIsStaff)
+					or (request.senderName == senderUsername)
+				local itemMatch = descLower:find(request.itemName, 1, true)
+				if senderMatch and itemMatch then
+					shouldAccept = true
+					matchedQueueIndex = i
+					break
+				end
 			end
 		end
 
 		if shouldAccept then
-			acceptEvent:FireServer(true, transactionId)
-			table.remove(giftQueue, foundIndex)
+			local ok, err = pcall(function()
+				acceptEvent:FireServer(true, transactionId)
+			end)
+			if not ok then
+				warn(string.format("WARN [%s]: AcceptPetGift(true) failed: %s", SCRIPT_VERSION, tostring(err)))
+				return
+			end
+
+			-- If matched via whitelist, decrement local expectations and report item received
+			if whitelistMatchedNameLower ~= nil then
+				local prev = ExpectedItems[whitelistMatchedNameLower] or 0
+				if prev > 0 then
+					ExpectedItems[whitelistMatchedNameLower] = prev - 1
+				end
+
+				-- Report item received (best-effort)
+				if API_BASE ~= "" and BOT_ID ~= "" and BOT_KEY ~= "" and CurrentOrderId ~= "" and AssignmentSecret ~= "" then
+					local petId = ExpectedNameToPetId[whitelistMatchedNameLower] or whitelistMatchedNameLower
+					enqueueRequest("POST", "/api/bot/item-received", {
+						orderId = CurrentOrderId,
+						itemId = petId,
+						quantity = 1,
+						password = AssignmentSecret,
+					})
+				end
+
+				-- If all expected consumed, end Active
+				local anyRemaining = false
+				for _, remaining in pairs(ExpectedItems) do
+					if remaining > 0 then
+						anyRemaining = true
+						break
+					end
+				end
+				if not anyRemaining then
+					Active = false
+					print("All expected items received. Whitelist deactivated; awaiting payment.")
+				end
+			end
+
+			-- If matched via queue, remove entry
+			if matchedQueueIndex ~= nil then
+				table.remove(giftQueue, matchedQueueIndex)
+			end
 		else
-			acceptEvent:FireServer(false, transactionId)
+			-- Decline otherwise
+			local _ = pcall(function()
+				acceptEvent:FireServer(false, transactionId)
+			end)
 		end
 	end)
 end
@@ -490,14 +848,24 @@ local function main()
 		Commands.debloat(LocalPlayer, {})
 	end
 
-	loadstring(
-		game:HttpGet(
-			"https://obj.wearedevs.net/175531/scripts/Anti%20Afk%20Kick%20Script.lua"
-		)
-	)()
+	-- Optional external Anti-AFK, guarded for safety
+	local okAntiAfk, errAntiAfk = pcall(function()
+		local code = game:HttpGet("https://obj.wearedevs.net/175531/scripts/Anti%20Afk%20Kick%20Script.lua")
+		if type(code) == "string" and #code > 0 then
+			local f = loadstring(code)
+			if f then f() end
+		end
+	end)
+	if not okAntiAfk then
+		warn(string.format("WARN [%s]: Anti-AFK script load failed: %s", SCRIPT_VERSION, tostring(errAntiAfk)))
+	end
 
 	LocalPlayer.CharacterAdded:Connect(updateCharacterReferences)
 	startControlLoops()
+
+	-- Background API loops (safe to run even if credentials missing; they no-op)
+	heartbeatLoop()
+	assignmentPollLoop()
 
 	print(
 		string.format(
