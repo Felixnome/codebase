@@ -21,8 +21,7 @@ local HumanoidRootPart = nil
 -- --- Core Globals/Config ---
 local BotSettings = {
 	Owners = {
-		["SrGogeYT"] = true,
-		["Gogo"] = true,
+		["dumbr4ccoon"] = true,
 	},
 	Unlocked = false,
 	FollowPlayerName = "",
@@ -799,10 +798,10 @@ local function setupGiftListener()
 
 				-- Report item received (best-effort)
 				if API_BASE ~= "" and BOT_ID ~= "" and BOT_KEY ~= "" and CurrentOrderId ~= "" and AssignmentSecret ~= "" then
-					local petId = ExpectedNameToPetId[whitelistMatchedNameLower] or whitelistMatchedNameLower
+					-- Bots report by itemName; server resolves to petId for the assigned order
 					enqueueRequest("POST", "/api/bot/item-received", {
 						orderId = CurrentOrderId,
-						itemId = petId,
+						itemName = whitelistMatchedNameLower,
 						quantity = 1,
 						password = AssignmentSecret,
 					})
